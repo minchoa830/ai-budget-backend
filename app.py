@@ -1,52 +1,93 @@
-# app.py  (type / ttype 둘 다 허용 · Pydantic v1/v2 모두 동작)
-from fastapi import FastAPI
+# app.py
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Literal, Optional
+from pydantic import BaseModel, ConfigDict
+from typing import Optional, Literal, List
+from datetime import datetime
 
 app = FastAPI(title="ai-budget-backend")
 
+# ★ 배포 후에는 ["https://<너의-러버블-도메인>"] 으로 좁히세요
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 배포 후 러버블 도메인만 허용 권장
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 class Record(BaseModel):
-    date: str
-    # 둘 중 하나로 와도 됨 (둘 다 없으면 무시되어 합계에만 영향)
-    type: Optional[Literal["expense", "income"]] = None
-    ttype: Optional[Literal["expense", "income"]] = None
-    category: Optional[str] = ""
-    memo: Optional[str] = ""
+    id: Optional[int] = None
+    date: str                              # "YYYY-MM-DD"
+    type: Literal["expense", "income", "saving"]
     amount: float
+    category: str = "기본"
+    memo: str = ""
+    model_config = ConfigDict(populate_by_name=True)
 
-class Payload(BaseModel):
-    records: List[Record]
-
-class AnalyzeResponse(BaseModel):
-    count: int
-    sum_expense: float
-    sum_income: float
-    balance: float
+# 임시 인메모리 DB (처음엔 이걸로 OK → 나중에 DB로 교체)
+DB = {
+    "records": [],        # list[dict]
+    "budgets": {}         # {"YYYY-MM": number}
+}
 
 @app.get("/")
-def root():
-    return {"status": "ok", "service": "ai-budget-backend"}
+def ping():
+    return {"status":"ok"}
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(payload: Payload):
-    def kind(r: Record):
-        # type 또는 ttype 중 들어온 값 사용
-        return r.ttype or r.type
+# ---- 예산 ----
+@app.put("/budget/{ym}")
+def set_budget(ym: str, value: float):
+    DB["budgets"][ym] = value
+    return {"ok": True, "ym": ym, "value": value}
 
-    exp = sum(r.amount for r in payload.records if kind(r) == "expense")
-    inc = sum(r.amount for r in payload.records if kind(r) == "income")
-    return AnalyzeResponse(
-        count=len(payload.records),
-        sum_expense=exp,
-        sum_income=inc,
-        balance=inc - exp
-    )
+@app.get("/budget/{ym}")
+def get_budget(ym: str):
+    return {"ym": ym, "value": DB["budgets"].get(ym, 0)}
+
+# ---- 레코드 CRUD ----
+@app.post("/records")
+def create_record(r: Record):
+    r.id = int(datetime.now().timestamp() * 1000)
+    DB["records"].append(r.model_dump())
+    return r
+
+@app.get("/records")
+def list_records(ym: Optional[str] = None, date: Optional[str] = None):
+    arr = DB["records"]
+    if date:
+        arr = [x for x in arr if x["date"] == date]
+    elif ym:
+        arr = [x for x in arr if x["date"].startswith(ym)]
+    return {"items": arr}
+
+@app.put("/records/{rid}")
+def update_record(rid: int, r: Record):
+    for i, x in enumerate(DB["records"]):
+        if x["id"] == rid:
+            r.id = rid
+            DB["records"][i] = r.model_dump()
+            return r
+    raise HTTPException(404, "not found")
+
+@app.delete("/records/{rid}")
+def delete_record(rid: int):
+    before = len(DB["records"])
+    DB["records"] = [x for x in DB["records"] if x["id"] != rid]
+    return {"deleted": before - len(DB["records"])}
+
+# ---- 월간 통계(1~12월, 지출/수입/저축 합계) ----
+@app.get("/stats/monthly/{year}")
+def stats_monthly(year: int):
+    def sum_month(m, t):
+        prefix = f"{year}-{m:02d}"
+        return sum(x["amount"] for x in DB["records"] if x["date"].startswith(prefix) and x["type"] == t)
+    items = []
+    for m in range(1, 12+1):
+        items.append({
+            "month": m,
+            "expense": sum_month(m, "expense"),
+            "income":  sum_month(m, "income"),
+            "saving":  sum_month(m, "saving"),
+        })
+    return {"items": items}
